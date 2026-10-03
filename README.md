@@ -2,18 +2,21 @@
 
 OpenAI-kompatibler Proxy (Port **1240**), der parallele Anfragen von
 OpenWebUI/LibreChat auf einen einzelnen Strata-Slot (Port 1238,
-`total_slots: 1`, FIFO) priorisiert: **Chat sofort, Recherche halten**.
+`total_slots: 1`, FIFO) in **drei Prioritätsstufen** führt:
+**Chat sofort, Research danach, Coding nur wenn nichts anderes ansteht**.
 
 ## Kernverhalten
 
 | Regel | Verhalten |
 |---|---|
-| Tagging | `model` endet auf `-RESEARCH` → LOW (halten), sonst HIGH (sofort) |
+| Tagging | `model`-Suffix → Prio: `-CHAT`=P0 (sofort), `-RESEARCH`=P1, `-CODING`=P2 (nur Rest); ohne Suffix = CHAT |
+| Priorität | P0 CHAT startet immer sofort und wird nie abgebrochen; P1 RESEARCH vor P2 CODING |
+| Abort-Hierarchie | CHAT bricht laufenden RESEARCH/CODING im Prefill, RESEARCH bricht CODING (nur **streaming**) |
 | Remapping | Upstream sieht immer den echten Strata-Modellnamen |
-| Hold | LOW startet erst nach `idle_hold_s` (Default 120 s) Ruhe seit letztem HIGH |
-| Abort | HIGH während LOW-Prefill (nur **streaming**): abbrechbar, solange Prefill-Zeit < 40 % der erwarteten (erwartet = `prompt_total / prefill_tok_s_mean`). Upstream-Disconnect = Strata-Cancel, LOW zurück an Queue-Anfang |
-| Kein Abort | Prefill-Zeit ≥ 40 % der erwarteten oder Generation läuft (`phase != "reading the prompt"`); non-streaming-LOW wird nie abgebrochen |
-| Aging | LOW wartet > `starvation_s` (1200 s) → wird wie HIGH behandelt |
+| Hold | P1/P2 starten erst nach `idle_hold_s` (Default 120 s) Ruhe seit letztem CHAT |
+| Abort | höhere Prio während Prefill (nur **streaming**): abbrechbar, solange Prefill-Zeit < 40 % der erwarteten (erwartet = `prompt_total / prefill_tok_s_mean`). Upstream-Disconnect = Strata-Cancel, verdrängter Request zurück an Queue-Anfang |
+| Kein Abort | Prefill-Zeit ≥ 40 % der erwarteten oder Generation läuft (`phase != "reading the prompt"`); non-streaming wird nie abgebrochen |
+| Aging | P1/P2 wartet > `starvation_s` (1200 s) → wird wie CHAT behandelt |
 | Client-Hold | SSE `: ping` alle 15 s; hartes Limit `max_client_hold_s=540` |
 | Scheduler | genau 1 aktiver Upstream-Request (Strata hat 1 Slot) |
 
@@ -57,11 +60,12 @@ damit der Service ohne offene Session läuft).
 
 ## OpenWebUI-Anbindung
 
-- Zwei Modell-Aliase registrieren (beide Base-URL → Proxy):
-  `<Modell>-CHAT` (HIGH) und `<Modell>-RESEARCH` (LOW)
+- Drei Modell-Aliase registrieren (alle Base-URL → Proxy):
+  `<Modell>-CHAT` (P0), `<Modell>-RESEARCH` (P1) und `<Modell>-CODING` (P2)
 - OWM-Registrierung läuft über die config-Tabelle `openai.api_base_urls`
   (JSON-Array, Werte immer `json.dumps`-encodiert), nicht nur über das Env
-- Task-Pfad automatisch LOW: `task.model.default` → RESEARCH-Alias
+- Task- (Research-) Pfad automatisch P1: `task.model.default` → RESEARCH-Alias;
+  Coding-/Agent-Pfad → CODING-Alias (P2)
 - Non-streaming-Timeouts erhöhen: `AIOHTTP_CLIENT_TIMEOUT=3600`,
   `AIOHTTP_CLIENT_STREAM_IDLE_TIMEOUT=600` (Default 300 s sprengt lange
   Recherche-Prefills)
@@ -69,16 +73,16 @@ damit der Service ohne offene Session läuft).
 ## Tests
 
 ```bash
-# 1) Mock-Strata (Port 19999)
-python3 tests/mock_strata.py &
-# 2) Proxy gegen Mock, beschleunigte Parameter
-PROXY_UPSTREAM=http://127.0.0.1:19999 PROXY_PORT=1241 \
-PROXY_IDLE_HOLD_S=5 PROXY_STARVATION_S=15 \
-python3 proxy.py &
-# 3) 17 Szenario-Checks (Tagging, Hold, Abort <85 %, kein Abort >=85 %,
-#    kein Abort in Generation, Heartbeats, Disconnect, Aging, Stats)
-python3 tests/test_scenarios.py
+# Suite (Mock-Strata :19999 + Proxy :1241, reinigt Prozesse selbst):
+#   wartet auf Ports, startet Mock+Proxy, läuft test_scenarios.py, räumt auf.
+PROXY_REAL_MODEL=test-model python3 tests/run_suite.py
 ```
+Oder manuell: `tests/mock_strata.py` (19999) + Proxy gegen `PROXY_UPSTREAM=
+http://127.0.0.1:19999 PROXY_PORT=1241 PROXY_IDLE_HOLD_S=5
+PROXY_STARVATION_S=15`, dann `python3 tests/test_scenarios.py`
+**20 Checks** (Tagging 3-Prio, Hold, Abort-Hierarchie CHAT>RESEARCH>CODING,
+kein Abort >=40 %/Generation, Heartbeats, Disconnect, Requeue-Stream, Aging,
+Stats).
 
 Live gegen echtes Strata: `tests/test_live_strata.py` (Szenario C),
 `tests/test_live_D.py` (Szenario D). Hinweis: Test-Prompts brauchen

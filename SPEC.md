@@ -27,8 +27,9 @@ OpenWebUI (Port 3004)
 ┌──────────────────────────────┐
 │   Model-Proxy (Port 1240)    │  Python 3.11+ / asyncio
 │  ┌────────────────────────┐  │
-│  │ Tagging (model-Feld)   │  │  <MODEL>-CHAT      → Prio HIGH (sofort)
-│  │                        │  │  <MODEL>-RESEARCH  → Prio LOW  (halten)
+│  │ Tagging (model-Feld)   │  │  <MODEL>-CHAT      → Prio 0 (sofort)
+│  │                        │  │  <MODEL>-RESEARCH  → Prio 1
+│  │                        │  │  <MODEL>-CODING    → Prio 2 (nur Rest)
 │  └────────────────────────┘  │
 │  ┌────────────────────────┐  │
 │  │ Prioritäts-Queue (Heap)│  │  (priority, arrival_time, seq, request)
@@ -97,13 +98,15 @@ Strata (<strata-host>:1238, unverändert)
 
 | OWM-Modell-Alias | Prio | Verwendung |
 |---|---|---|
-| `<MODEL>-CHAT` | HIGH (0) | normale Chat-Nachrichten |
-| `<MODEL>-RESEARCH` | LOW (1) | Recherche-/Task-/Sub-Agent-Verwaltung |
+| `<MODEL>-CHAT` | 0 (sofort) | normale Chat-Nachrichten |
+| `<MODEL>-RESEARCH` | 1 | Recherche-/Task-/Sub-Agent-Verwaltung |
+| `<MODEL>-CODING` | 2 (nur Rest) | Coding-/Agent-Jobs, nur wenn nichts Höheres ansteht |
 
-**Proxy-Tagging:** Liest `model` aus Request-Body. Endet es auf `-RESEARCH` → LOW, sonst HIGH. Vor Weiterleitung an Strata: Model-Feld auf den echten Strata-Namen `<MODEL>` mappen (Strata lehnt unbekannte Modellnamen ab, 404).
+**Proxy-Tagging:** Liest `model` aus Request-Body. Endet es auf `-CODING` → Prio 2, `-RESEARCH` → Prio 1, sonst (inkl. ohne/beliebigem Suffix) → Prio 0. Vor Weiterleitung an Strata: Model-Feld auf den echten Strata-Namen `<MODEL>` mappen (Strata lehnt unbekannte Modellnamen ab, 404).
 
 **OWM-Config (config-Tabelle der OpenWebUI-DB):**
-- `task.model.default` → `<MODEL>-RESEARCH` (damit Sub-Agents/Tasks automatisch getaggt)
+- `task.model.default` → `<MODEL>-RESEARCH` (damit Sub-Agents/Tasks automatisch P1)
+- Coding-/Agent-Pfad → `<MODEL>-CODING` (P2)
 - `ui.default_models` / `ui.default_pinned_models` → `<MODEL>-CHAT`
 - WICHTIG: Werte immer **JSON-encodiert** schreiben (json.dumps)! Rohe Strings brechen OWM (JSONDecodeError beim Start, 500er).
 - Parallel betriebene Zusatz-Modelle unangetastet lassen.
@@ -118,21 +121,23 @@ Strata (<strata-host>:1238, unverändert)
 ```
 HOLDING     – Request eingegangen, in Queue, noch nicht an Strata gesendet
 RUNNING     – genau 1 Request wird an Strata gestreamt
-ABORTED     – RUNNING war LOW, Prefill < 85 %, Chat kam rein → Upstream geschlossen,
+ABORTED     – RUNNING war P1/P2, Prefill < 40 %, höhere Prio kam rein → Upstream geschlossen,
               Request wandert zurück an Queue-Anfang (HOLDING) oder komplett ans Ende (konfigurierbar)
 DONE        – Antwort komplett an Client geliefert
 ```
 
-### 5.2 Scheduler-Regeln (Priorität 1 = höchste)
-1. **Prioritäts-Heap:** `(priority, arrival_seq, request)` — HIGH immer vor LOW, innerhalb gleicher Prio FIFO (arrival_seq)
+### 5.2 Scheduler-Regeln (Priorität 0 = höchste)
+1. **Prioritäts-Heap:** `(priority, arrival_seq, request)` — CHAT(0) immer vor RESEARCH(1) vor CODING(2), innerhalb gleicher Prio FIFO (arrival_seq)
 2. **Genau 1 aktiver Upstream-Request** an Strata (1 Slot!)
-3. **Startregel für LOW (Recherche):** nur senden, wenn (a) kein HIGH in Queue und (b) **kein Chat** in den letzten `idle_hold_s` Sekunden eingegangen (Timer läuft ab letzter HIGH-Ankunft)
-4. **Unterbrechung (nur Streaming; reuse-fest über Prefill-Dauer):** Kommt HIGH, während LOW **im Prefill** ist (`phase == "reading the prompt"`), und der LOW ist ein **Streaming-Request**:
-   - `elapsed < 0.4 × erwarteter Prefill-Zeit` (erwartet = `prompt_total / prefill_tok_s_mean`) → **Abbruch** (Upstream schließen), LOW in Queue zurück (vorne)
-   - sonst (`≥ 40 %` oder `phase != reading`) → **laufen lassen**, HIGH wartet (Queue)
-   - **Non-streaming LOW wird nie abgebrochen** — er kann nicht per SSE-Heartbeat gehalten werden; ein Requeue würde das Client-Timeout reißen (`TransferEncodingError`). Er läuft immer fertig, HIGH wartet dahinter.
-5. **HIGH + Strata frei** → sofort senden
-6. **Starvation-Schutz (Aging):** LOW wartet > `starvation_s` (z. B. 1200 s) → temporär wie HIGH behandeln (einmalig)
+3. **Startregel CHAT (0):** sofort, wenn Strata frei; wird **nie** abgebrochen (gate sofort offen)
+4. **Startregel P1/P2:** nur senden, wenn (a) keine höhere Prio in Queue und (b) **kein CHAT** in den letzten `idle_hold_s` Sekunden eingegangen (Timer läuft ab letzter CHAT-Ankunft)
+5. **Unterbrechung (nur Streaming; reuse-fest über Prefill-Dauer):** Kommt höhere Prio, während P1/P2 **im Prefill** ist (`phase == "reading the prompt"`) und Streaming-Request:
+   - `elapsed < 0.4 × erwarteter Prefill-Zeit` (erwartet = `prompt_total / prefill_tok_s_mean`) → **Abbruch** (Upstream schließen), verdrängter Request in Queue zurück (vorne)
+   - sonst (`≥ 40 %` oder `phase != reading`) → **laufen lassen**, höhere Prio wartet (Queue)
+   - **Non-streaming wird nie abgebrochen** — er kann nicht per SSE-Heartbeat gehalten werden; ein Requeue würde das Client-Timeout reißen (`TransferEncodingError`). Er läuft immer fertig, höhere Prio wartet dahinter.
+   - **Abort-Hierarchie:** CHAT bricht RESEARCH(1)+CODING(2); RESEARCH bricht CODING(2); CHAT nie.
+6. **CHAT + Strata frei** → sofort senden
+7. **Starvation-Schutz (Aging):** P1/P2 wartet > `starvation_s` (z. B. 1200 s) → temporär wie CHAT behandeln (einmalig)
 
 ### 5.3 Parameter (Konfig, Defaults)
 | Param | Default | Bedeutung |
@@ -151,20 +156,23 @@ DONE        – Antwort komplett an Client geliefert
 
 ## 6. Ablauf-Szenarien
 
-### Szenario A: Chat kommt, keine Recherche läuft
-Chat → tag HIGH → Strata frei → sofort senden, streamen, fertig. Keine Verzögerung.
+### Szenario A: Chat kommt, nichts Höheres läuft
+Chat → tag P0 → Strata frei → sofort senden, streamen, fertig. Keine Verzögerung.
 
-### Szenario B: Recherche wartet (HOLDING), Chat kommt dazwischen
-Recherche eingetroffen (LOW) → Timer startet → Chat (HIGH) kommt → Timer **reset** → 120 s nach letztem Chat ohne weitere Chats: Recherche wird gesendet.
+### Szenario B: Research/Coding wartet (HOLDING), Chat kommt dazwischen
+P1/P2 eingetroffen (Timer startet) → Chat (P0) kommt → Timer **reset** → 120 s nach letztem Chat ohne weitere Chats: Research wird gesendet.
 
-### Szenario C: Recherche läuft im Prefill (20 % der erwarteten Dauer), Streaming, Chat kommt
-Chat (HIGH) → Scheduler prüft laufenden LOW (streaming): `elapsed = 0.2 × erwartete Prefill-Zeit < 0.4` → Upstream schließen → LOW zurück an Queue-Start → Chat senden → danach (120 s Ruhe) Recherche **komplett neu** (Prefill-Verlust akzeptiert).
+### Szenario C: Research läuft im Prefill (20 % der erwarteten Dauer), Streaming, Chat kommt
+Chat (P0) → Scheduler prüft laufenden Research (streaming): `elapsed = 0.2 × erwartete Prefill-Zeit < 0.4` → Upstream schließen → Research zurück an Queue-Start (Requeue-Stream bleibt offen, liefert später Chunks) → Chat senden → danach (120 s Ruhe) Research **komplett neu** (Prefill-Verlust akzeptiert).
 
-### Szenario D: Recherche fast fertig mit Prefill (95 % der erwarteten Dauer), Chat kommt
+### Szenario D: Research fast fertig mit Prefill (95 % der erwarteten Dauer), Chat kommt
 `0.95 ≥ 0.4` → **nicht abbrechen** → Chat wartet ~Rest-Prefill + Generation (kurz) → Chat bekommt Slot.
 
-### Szenario E: Recherche generiert bereits (phase = answering)
+### Szenario E: Research generiert bereits (phase = answering)
 Nicht abbrechen (Generation unterbrechen = Teilantwort verlieren) → Chat wartet bis `DONE`.
+
+### Szenario F (3-Prio): Coding läuft im Prefill, Research + dann Chat kommen
+Coding (P2) läuft im Prefill (20 %) → **Research (P1) kommt** → `0.2 < 0.4` → Coding abbrechen, requeued → Research senden. Während Research läuft → **Chat (P0) kommt** → aber Research ≥ 40 % der erwarteten Dauer → Research läuft fertig, Chat wartet → danach Coding (Rest). Ergebnis: Coding nur, wenn weder Chat noch Research anstehen, wie spezifiziert.
 
 ---
 
@@ -217,7 +225,7 @@ config.py           – Parameter-Sektion 5.3, CLI/Env übersteuerbar (PROXY_*)
 - **Idempotenz:** Recherche-Requests nach Abbruch unverändert neu senden (gleicher Body inkl. gleicher `messages`), KEINE Token/Streams an Client weiterreichen, die vor dem Abbruch ankamen
 
 ### 9.4 Betrieb
-- systemd-User-Unit `model-proxy.service` (`ExecStart=/usr/bin/python3 …/proxy.py`, Restart=on-failure) auf dem Betriebshost
+- systemd-User-Unit `model-proxy.service` (wie strata.service: `ExecStart=/usr/bin/python3 …/proxy.py`, Restart=on-failure) auf diesem Host
 - Log: stdout/Journal; jeder Request mit Tag/Prio/Zeiten loggen (für spätere Analyse: „wie lange wartete ein Chat?")
 
 ---
@@ -234,14 +242,18 @@ config.py           – Parameter-Sektion 5.3, CLI/Env übersteuerbar (PROXY_*)
 
 ## 11. Testplan (vor Produktiv)
 
-1. **Tagging:** Request mit `model=X-CHAT` und `X-RESEARCH` → korrekte Prio-Zuordnung, /v1/models zeigt beide Aliase
-2. **Chat sofort:** HIGH bei freiem Strata → < 1 s Verzögerung, identische Antwort wie ohne Proxy
-3. **Hold-Logik:** LOW senden, 5 s später HIGH senden → Strata-Engine bekommt LOW erst 120 s nach HIGH (Log: „deferred")
-4. **Abbruch im Prefill:** LOW mit 200k-Prompt starten, 30 s später HIGH → /metrics zeigt prompt_read ~15 % → Upstream wird geschlossen → HIGH antwortet sofort → LOW läuft danach neu (Prefill von vorn)
-5. **Kein Abbruch bei 90 %:** LOW mit großem Prompt, HIGH erst bei prompt_read > 90 % → kein Cancel, HIGH wartet
-6. **Client-Verhalten:** während HOLDING sendet Proxy `: ping` → Client (OWM) zeigt „Antwort wird generiert", kein Fehler
-7. **Strata-down:** Proxy liefert 503 an Client, Queue bleibt konsistent, nach Strata-Start läuft alles normal
-8. **Remapping:** Upstream sieht nur `<MODEL>` (nie die Aliase)
+1. **Tagging:** Request mit `model=X-CHAT`, `X-RESEARCH`, `X-CODING` → korrekte 3-Prio-Zuordnung, /v1/models zeigt alle drei Aliase
+2. **Chat sofort:** CHAT bei freiem Strata → < 1 s Verzögerung, identische Antwort wie ohne Proxy
+3. **Hold-Logik:** Research senden, 5 s später CHAT senden → Strata-Engine bekommt Research erst 120 s nach CHAT (Log: „deferred")
+4. **Abbruch im Prefill:** Research mit 200k-Prompt starten, 30 s später CHAT → /metrics zeigt prompt_read ~15 % → Upstream wird geschlossen → CHAT antwortet sofort → Research läuft danach neu (Prefill von vorn, Requeue-Stream liefert Chunks)
+5. **Kein Abbruch bei ≥ 40 %:** Research mit großem Prompt, CHAT erst bei `elapsed ≥ 40 %` der erwarteten Prefill-Dauer → kein Cancel, CHAT wartet
+6. **Abort-Hierarchie P0>P1>P2:** laufendes CODING im Prefill, Research kommt → CODING abgebrochen (requeued), Research senden; laufendes CODING, CHAT kommt → ebenfalls Abort
+7. **Client-Verhalten:** während HOLDING sendet Proxy `: ping` → Client (OWM) zeigt „Antwort wird generiert", kein Fehler
+8. **Strata-down:** Proxy liefert 503 an Client, Queue bleibt konsistent, nach Strata-Start läuft alles normal
+9. **Remapping:** Upstream sieht nur `<MODEL>` (nie die Aliase)
+10. **Requeue-Stream-Idempotenz:** nach Abort bleibt Client-SSE offen, verdrängter Request liefert später vollständige Chunks (kein `TransferEncodingError`)
+
+Tests laufen per `tests/run_suite.py` (Mock-Strata :19999 + Proxy :1241), **20 Checks** — nur Logik, kein echtes Strata nötig.
 
 ---
 

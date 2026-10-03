@@ -47,8 +47,13 @@ async def completions(request: web.Request):
 
     await CURRENT.wait()
     CURRENT.clear()
+    # Abort-Logik nutzt Dauer-Schwelle: expected = prompt_total/prefill_tok_s_mean.
+    # Damit die simulierte Prefill-Dauer (=prefill_s) korrekt erwartet wird,
+    # muss die Rate künstlich zu total/prefill_s gesetzt sein.
     STATE.update(state="processing", phase="reading the prompt",
                  prompt_total=n_prompt, prompt_read=0, generated=0,
+                 prefill_tok_s_mean=(n_prompt / prefill_s if prefill_s > 0
+                                     else 530.0),
                  elapsed_s=0)
     t0 = time.monotonic()
 

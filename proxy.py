@@ -28,8 +28,12 @@ sched = Scheduler(strata)
 
 
 def tag_priority(model: str) -> int:
-    return config.LOW if (model or "").endswith(config.RESEARCH_SUFFIX) \
-        else config.HIGH
+    m = model or ""
+    if m.endswith(config.CODING_SUFFIX):
+        return config.CODING_PRIO
+    if m.endswith(config.RESEARCH_SUFFIX):
+        return config.RESEARCH_PRIO
+    return config.CHAT_PRIO
 
 
 # ---- /v1/chat/completions ------------------------------------------------
@@ -176,7 +180,8 @@ async def models(_request: web.Request) -> web.Response:
         names = [d.get("id") for d in m["data"]]
     alias_ids = [config.REAL_MODEL,
                  config.REAL_MODEL + "-CHAT",
-                 config.REAL_MODEL + "-RESEARCH"]
+                 config.REAL_MODEL + "-RESEARCH",
+                 config.REAL_MODEL + "-CODING"]
     data = [{"id": i, "object": "model", "owned_by": "strata"}
             for i in alias_ids]
     return web.json_response({"object": "list", "data": data})

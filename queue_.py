@@ -52,6 +52,9 @@ class PriorityQueue:
     def peek(self) -> QueuedRequest | None:
         return self._heap[0][2] if self._heap else None
 
+    def pending(self) -> list[QueuedRequest]:
+        return [h[2] for h in self._heap]
+
     def pop(self) -> QueuedRequest | None:
         return heapq.heappop(self._heap)[2] if self._heap else None
 

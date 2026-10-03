@@ -19,22 +19,33 @@ class Scheduler:
         self.running: QueuedRequest | None = None
         self.run_task: asyncio.Task | None = None
         self.last_high: float = 0.0          # monotonic; 0 = nie -> LOW darf sofort
-        self.stats = {"high": 0, "low": 0, "done": 0, "aborted": 0,
+        self.stats = {"high": 0, "mid": 0, "low": 0, "done": 0, "aborted": 0,
                       "errors": 0, "dropped": 0, "started": 0,
                       "waits": []}
         self._loop: asyncio.Task | None = None
 
     # ---- Eingang -------------------------------------------------------
     def submit(self, req: QueuedRequest) -> None:
-        if req.priority == config.HIGH:
+        if req.priority == config.CHAT_PRIO:
             self.last_high = time.monotonic()
             self.stats["high"] += 1
+        elif req.priority == config.RESEARCH_PRIO:
+            self.stats["mid"] += 1
         else:
             self.stats["low"] += 1
         self.q.push(req)
         log.info("ENQUEUE prio=%s seq=%s stream=%s queue=%d",
-                 "HIGH" if req.priority == config.HIGH else "LOW",
+                 self._prio_name(req.priority),
                  req.seq, req.stream, len(self.q))
+
+    def _prio_name(self, prio: int) -> str:
+        return {config.CHAT_PRIO: "CHAT", config.RESEARCH_PRIO: "RESEARCH",
+                config.CODING_PRIO: "CODING"}.get(prio, f"P{prio}")
+
+    def _highest_pending(self) -> int | None:
+        """Höchste in der Queue wartende Priorität (kleinste Zahl) oder None."""
+        pending = [r.priority for r in self.q.pending()]
+        return min(pending) if pending else None
 
     # ---- Lifecycle -----------------------------------------------------
     def start(self) -> None:
@@ -58,8 +69,12 @@ class Scheduler:
     async def _tick(self) -> None:
         now = time.monotonic()
 
-        # 1) Unterbrechungs-Check für laufenden LOW im Prefill (Regel 5.2)
-        if self.running is not None and self.running.priority == config.LOW \
+        # 1) Unterbrechungs-Check für laufenden LOW/MID im Prefill (Regel 5.2).
+        #    Ein laufender Request (RESEARCH oder CODING) wird bei EINER HÖHEREN
+        #    Prio in der Queue abgebrochen: CHAT bricht RESEARCH+CODING,
+        #    RESEARCH bricht CODING. CHAT (0) selbst wird nie abgebrochen.
+        if self.running is not None \
+                and self.running.priority > config.CHAT_PRIO \
                 and self.running.stream \
                 and not self.running.gate.is_set():
             # ABORT nur für streaming Requests. Non-streaming (OWM Research/Task,
@@ -83,17 +98,25 @@ class Scheduler:
                     elapsed = live.get("elapsed_s") or 0
                     expected = (total / rate) if rate else 0
                     under_effort = expected <= 0 or elapsed < expected * 0.4
-                    if self.q.has_priority(config.HIGH) and under_effort:
-                        log.info("ABORT-TRIGGER seq=%s elapsed=%.0fs "
-                                 "erwartet=%.0fs (%.0f%%) -> HIGH wartet",
-                                 self.running.seq, elapsed, expected,
-                                 100 * elapsed / expected if expected else 0)
+                    higher = self._highest_pending()
+                    if higher is not None and higher < self.running.priority \
+                            and under_effort:
+                        log.info("ABORT-TRIGGER seq=%s prio=%s elapsed=%.0fs "
+                                 "erwartet=%.0fs (%.0f%%) -> %s wartet",
+                                 self.running.seq,
+                                 self._prio_name(self.running.priority),
+                                 elapsed, expected,
+                                 100 * elapsed / expected if expected else 0,
+                                 self._prio_name(higher))
                         self.run_task.cancel()
                         return
-                    elif self.q.has_priority(config.HIGH):
-                        log.info("NO-ABORT seq=%s elapsed=%.0fs "
-                                 "erwartet=%.0fs -> HIGH wartet",
-                                 self.running.seq, elapsed, expected)
+                    elif higher is not None and higher < self.running.priority:
+                        log.info("NO-ABORT seq=%s prio=%s elapsed=%.0fs "
+                                 "erwartet=%.0fs -> %s wartet",
+                                 self.running.seq,
+                                 self._prio_name(self.running.priority),
+                                 elapsed, expected,
+                                 self._prio_name(higher))
 
         # 2) Start-Entscheidung (genau 1 aktiver Upstream-Request)
         if self.running is None and len(self.q):
@@ -105,23 +128,26 @@ class Scheduler:
                 log.info("DROPPED (pre-start) seq=%s -> nie gesendet",
                          head.seq)
                 return
-            # Starvation-Schutz: LOW wartet > starvation_s -> einmalig wie HIGH
-            if head.priority == config.LOW and head.waited() > config.STARVATION_S:
-                log.info("AGING seq=%s waited=%.0fs -> HIGH-Prio", head.seq,
+            # Starvation-Schutz: RESEARCH/CODING wartet > starvation_s -> CHAT-Prio
+            if head.priority > config.CHAT_PRIO \
+                    and head.waited() > config.STARVATION_S:
+                log.info("AGING seq=%s prio=%s waited=%.0fs -> CHAT-Prio",
+                         head.seq, self._prio_name(head.priority),
                          head.waited())
-                head.priority = config.HIGH
+                head.priority = config.CHAT_PRIO
                 self.q.promote(head)
                 head.gate.set()  # nicht mehr abortbar -> direkt streamen
-            if head.priority == config.HIGH:
+            if head.priority == config.CHAT_PRIO:
                 self._start(self.q.pop())
-            elif not self.q.has_priority(config.HIGH) \
+            elif not self.q.has_priority(config.CHAT_PRIO) \
                     and (now - self.last_high) >= config.IDLE_HOLD_S:
-                log.info("deferred LOW seq=%s gestartet nach %s",
+                log.info("deferred %s seq=%s gestartet nach %s",
+                         self._prio_name(head.priority),
                          head.seq,
                          f"{now - self.last_high:.0f}s Ruhe"
                          if self.last_high else "kein Chat je")
                 self._start(self.q.pop())
-            # else: weiter halten (Szenario B)
+                # else: weiter halten (Szenario B)
 
     async def _live(self):
         m = await self.strata.get_json("/metrics")
@@ -131,11 +157,11 @@ class Scheduler:
         req.state = "RUNNING"
         self.running = req
         self.stats["started"] += 1
-        if req.priority == config.HIGH:
-            req.gate.set()  # HIGH wird nie abgebrochen -> sofort durchreichen
+        if req.priority == config.CHAT_PRIO:
+            req.gate.set()  # CHAT wird nie abgebrochen -> sofort durchreichen
         self.run_task = asyncio.create_task(self._run(req))
         log.info("START prio=%s seq=%s waited=%.1fs",
-                 "HIGH" if req.priority == config.HIGH else "LOW",
+                 self._prio_name(req.priority),
                  req.seq, req.waited())
 
     async def _run(self, req: QueuedRequest) -> None:
@@ -180,8 +206,7 @@ class Scheduler:
     def snapshot(self) -> dict:
         return {
             "running": ({"seq": self.running.seq,
-                         "prio": "HIGH" if self.running.priority == config.HIGH
-                                 else "LOW",
+                         "prio": self._prio_name(self.running.priority),
                          "state": self.running.state,
                          "gate_open": self.running.gate.is_set()}
                         if self.running else None),

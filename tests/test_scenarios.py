@@ -14,6 +14,7 @@ MOCK = "http://127.0.0.1:19999"
 MODEL = os.getenv("PROXY_REAL_MODEL", "test-model")
 CHAT = MODEL + "-CHAT"
 RES = MODEL + "-RESEARCH"
+COD = MODEL + "-CODING"
 PASS, FAIL = [], []
 
 
@@ -94,10 +95,10 @@ async def main():
         check("T3b LOW gehalten (>=5s nach Chat)", dtl >= 5,
               f"low dt={dtl:.1f}s")
 
-        # --- T4: Abbruch im Prefill (<85%) ---
-        print("T4: Abort im Prefill")
+        # --- T4: Abbruch im Prefill (streaming, da Abort nur für streaming) ---
+        print("T4: Abort im Prefill (streaming)")
         before = len(await cancel_log(sess))
-        low_task = asyncio.create_task(post_chat(
+        low_task = asyncio.create_task(stream_chat(
             sess, RES, "y" * 100,
             extra={"mock_prefill_s": 20}))
         await asyncio.sleep(4)  # LOW im Prefill bei ~20%
@@ -108,10 +109,9 @@ async def main():
               f"cancel_log={logs[-1] if logs else None}")
         check("T4b Chat antwortet schnell", st4 == 200 and dt4 < 10,
               f"dt={dt4:.1f}s")
-        stl, dl, dtl = await low_task
-        j = json.loads(dl)
+        stl, pl, cl, fbl, dtl = await low_task
         check("T4c LOW später komplett (transparent)",
-              stl == 200 and j.get("choices"), f"low dt={dtl:.1f}s")
+              stl == 200 and len(cl) >= 5, f"low dt={dtl:.1f}s chunks={len(cl)}")
 
         # --- T5: Kein Abbruch bei >=85% ---
         print("T5: Kein Abort bei hohem Fortschritt")
@@ -184,6 +184,28 @@ async def main():
         # Nach T8 idle; letzter Chat ist lange her -> LOW startet sofort
         check("T9a LOW nach Ruhezeit bedient", st9 == 200 and dt9 < 8,
               f"dt={dt9:.1f}s")
+
+        # --- T11: 3-Prio-Routing (CODING < RESEARCH < CHAT) ---
+        print("T11: CODING-Priorität (unter RESEARCH & CHAT)")
+        before = len(await cancel_log(sess))
+        cod_task = asyncio.create_task(stream_chat(
+            sess, COD, "c" * 100,
+            extra={"mock_prefill_s": 20}))
+        await asyncio.sleep(4)  # CODING im Prefill (~20%)
+        stc, dc, dtc = await post_chat(
+            sess, RES, "r" * 100,   # RESEARCH soll CODING verdrängen
+            extra={"mock_prefill_s": 20})
+        logs = await cancel_log(sess)
+        check("T11a RESEARCH verdrängt CODING (Abort)",
+              len(logs) > before, f"cancels={len(logs)-before}")
+        # RESEARCH wurde gestartet (läuft); CODING requeued hinter
+        stcod, pco, cco, fbco, dtcod = await cod_task
+        check("T11b CODING später trotzdem komplett",
+              stcod == 200 and len(cco) >= 5, f"dt={dtcod:.1f}s chunks={len(cco)}")
+        stc2, dc2, dtc2 = await post_chat(
+            sess, CHAT, "hi")  # CHAT -> läuft sofort durch (RESEARCH/CODING hinten)
+        check("T11c CHAT geht durch wenn fertig", stc2 == 200,
+              f"dt={dtc2:.1f}s")
 
         # --- T10: Proxy-Metriken ---
         print("T10: /metrics Snapshot")

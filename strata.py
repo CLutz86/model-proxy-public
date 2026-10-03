@@ -76,8 +76,14 @@ class StrataClient:
                     req.result = (resp.status, data)
                 return "done"
         except asyncio.CancelledError:
-            # Upstream-Verbindung geschlossen = Strata bricht ab (3.3)
-            if req.stream:
+            # Upstream-Verbindung geschlossen = Strata bricht ab (3.3).
+            # Prioritäts-Abort (Client noch da): KEIN SENTINEL legen, sonst
+            # bricht proxy._stream_response sofort ab (Z.99), bevor das
+            # ABORTED_SENTINEL aus scheduler._run (requeue) gelesen wird ->
+            # Requeue-Stream would stay dead (T4c/T11b). scheduler._run legt
+            # das ABORTED_SENTINEL. Nur bei echtem Client-Disconnect (dropped)
+            # Stream beenden.
+            if req.stream and req.dropped:
                 req.chunks.put_nowait(SENTINEL)
             log.info("ABORTED seq=%s nach %.1fs (Prefill-Arbeit verfällt)",
                      req.seq, req.waited())
